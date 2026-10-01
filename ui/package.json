@@ -1,0 +1,35 @@
+{
+  "name": "epdi-ai-gateway-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ORGA AI consumption dashboard. Built by the Docker node stage into /app/static and served by the gateway under /admin.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "//": [
+    "Versions are pinned exactly, not caret-ranged: this bundle is built inside the",
+    "container image, so a floating minor would make two builds of the same commit",
+    "produce different artefacts - which defeats the point of immutable ECR tags.",
+    "",
+    "React 18 rather than 19 on purpose. recharts 2.x and @tanstack/react-table 8.x",
+    "are both long-proven against 18, and nothing here needs a React 19 feature.",
+    "Upgrading is a deliberate task with a test pass, not a default."
+  ],
+  "dependencies": {
+    "@tanstack/react-table": "8.20.5",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "recharts": "2.15.0"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "typescript": "5.7.2",
+    "vite": "6.0.7"
+  }
+}

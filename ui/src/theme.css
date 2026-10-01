@@ -1,0 +1,770 @@
+/* ORGA AI consumption dashboard - design tokens and layout.
+ *
+ * Hand-written CSS rather than a utility framework or a component library: the whole
+ * surface is about a dozen components, and a framework would add a build dependency
+ * and a supply-chain entry to the ENS record in exchange for classes we would use
+ * once each.
+ *
+ * The accent (#d94f2b) is the same one used in the customer-facing token guide, so
+ * the dashboard reads as part of the same deliverable rather than a stray internal
+ * tool.
+ */
+
+:root {
+  /* Surfaces, dark to light. Three levels only - more and the hierarchy stops
+     being legible on a projector, which is where this gets demoed. */
+  --bg: #0b0e13;
+  --surface: #12161d;
+  --surface-raised: #171c25;
+  --border: #232a35;
+  --border-strong: #2f3846;
+
+  --text: #e8edf4;
+  --text-muted: #94a1b2;
+  --text-faint: #6b7686;
+
+  --accent: #d94f2b;
+  --accent-soft: rgba(217, 79, 43, 0.14);
+  --accent-line: rgba(217, 79, 43, 0.45);
+
+  /* Semantic states. Deliberately not pure red/green: on a dark background the
+     saturated versions vibrate and are hard to read at small sizes. */
+  --ok: #3fb950;
+  --notice: #58a6ff;
+  --warning: #d29922;
+  --critical: #f85149;
+
+  /* Categorical palette for models. Ordered so the first three - which cover the
+     models that actually carry the spend - stay distinguishable for the common
+     forms of colour blindness, rather than being a red/green pair. */
+  --c1: #6ea8fe;
+  --c2: #d94f2b;
+  --c3: #f0b429;
+  --c4: #4cc9b0;
+  --c5: #b083f0;
+  --c6: #f78da7;
+  --c7: #7ad3ff;
+  --c8: #9aa7b4;
+
+  --radius: 12px;
+  --radius-sm: 8px;
+  --gap: 16px;
+
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px rgba(0, 0, 0, 0.28);
+
+  --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Every figure on this page is compared against the one above it, so digits must
+   line up in a column. Without tabular numerals a table of amounts reads as ragged
+   and is measurably slower to scan. */
+.num {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' 1;
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 0.92em;
+}
+
+/* --- app shell ------------------------------------------------------------- */
+
+.app {
+  min-height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: var(--gap);
+  padding: 12px 24px;
+  background: rgba(11, 14, 19, 0.86);
+  backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-right: auto;
+  min-width: 0;
+}
+
+.brand-mark {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  font-size: 15px;
+}
+
+.brand-mark span {
+  color: var(--accent);
+}
+
+.brand-sub {
+  color: var(--text-faint);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.content {
+  padding: 20px 24px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  max-width: 1680px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* --- controls -------------------------------------------------------------- */
+
+.btn {
+  appearance: none;
+  border: 1px solid var(--border-strong);
+  background: var(--surface-raised);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 7px 13px;
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.btn:hover {
+  border-color: var(--accent-line);
+}
+
+.btn:focus-visible,
+.seg button:focus-visible,
+.input:focus-visible,
+.row-clickable:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.btn-primary {
+  background: var(--accent-soft);
+  border-color: var(--accent-line);
+  color: #ffd9cd;
+}
+
+/* Segmented range picker. A segmented control rather than a dropdown because the
+   four presets cover almost every use and are then one click instead of two. */
+.seg {
+  display: inline-flex;
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.seg button {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--border);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 13px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.seg button:last-child {
+  border-right: 0;
+}
+
+.seg button[aria-pressed='true'] {
+  background: var(--accent-soft);
+  color: #ffd9cd;
+  font-weight: 600;
+}
+
+.input {
+  background: var(--surface-raised);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 11px;
+  color-scheme: dark;
+}
+
+.input::placeholder {
+  color: var(--text-faint);
+}
+
+/* --- cards and grid -------------------------------------------------------- */
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.card-title {
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  margin: 0;
+}
+
+.card-note {
+  color: var(--text-faint);
+  font-size: 12px;
+  margin-left: auto;
+  text-align: right;
+}
+
+.card-body {
+  padding: 16px 18px;
+  flex: 1;
+  min-width: 0;
+}
+
+.card-body.flush {
+  padding: 0;
+}
+
+.grid {
+  display: grid;
+  gap: var(--gap);
+}
+
+.grid-kpi {
+  grid-template-columns: repeat(auto-fit, minmax(196px, 1fr));
+}
+
+.grid-main {
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+}
+
+.grid-split {
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+}
+
+@media (max-width: 1100px) {
+  .grid-main {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 640px) {
+  .topbar {
+    flex-wrap: wrap;
+  }
+
+  .content {
+    padding: 16px 12px 40px;
+  }
+}
+
+/* --- KPI ------------------------------------------------------------------- */
+
+.kpi {
+  padding: 15px 17px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  position: relative;
+  overflow: hidden;
+}
+
+.kpi-label {
+  color: var(--text-muted);
+  font-size: 11.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.kpi-value {
+  font-size: 25px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+}
+
+.kpi-unit {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-muted);
+  margin-left: 3px;
+}
+
+.kpi-foot {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+.kpi-spark {
+  margin: 2px -17px -15px;
+  height: 40px;
+}
+
+/* --- badges and pills ------------------------------------------------------ */
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  font-weight: 650;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.pill-ok {
+  color: var(--ok);
+  background: rgba(63, 185, 80, 0.12);
+  border-color: rgba(63, 185, 80, 0.3);
+}
+
+.pill-notice {
+  color: var(--notice);
+  background: rgba(88, 166, 255, 0.12);
+  border-color: rgba(88, 166, 255, 0.3);
+}
+
+.pill-warning {
+  color: var(--warning);
+  background: rgba(210, 153, 34, 0.13);
+  border-color: rgba(210, 153, 34, 0.32);
+}
+
+.pill-critical {
+  color: var(--critical);
+  background: rgba(248, 81, 73, 0.13);
+  border-color: rgba(248, 81, 73, 0.32);
+}
+
+.pill-muted {
+  color: var(--text-faint);
+  background: rgba(148, 161, 178, 0.1);
+  border-color: var(--border-strong);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+}
+
+/* --- banners --------------------------------------------------------------- */
+
+.banner {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 13px 16px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.banner-warning {
+  border-color: rgba(210, 153, 34, 0.42);
+  background: rgba(210, 153, 34, 0.08);
+}
+
+.banner-critical {
+  border-color: rgba(248, 81, 73, 0.42);
+  background: rgba(248, 81, 73, 0.08);
+}
+
+.banner strong {
+  display: block;
+  margin-bottom: 2px;
+}
+
+.banner p {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+.banner code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 5px;
+}
+
+/* --- table ----------------------------------------------------------------- */
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+table.data th {
+  text-align: left;
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  font-weight: 650;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+  position: sticky;
+  top: 0;
+  white-space: nowrap;
+}
+
+table.data th.sortable {
+  cursor: pointer;
+  user-select: none;
+}
+
+table.data th.sortable:hover {
+  color: var(--text);
+}
+
+table.data th .arrow {
+  color: var(--accent);
+  margin-left: 4px;
+}
+
+table.data td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
+
+table.data tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+table.data tbody tr.row-clickable {
+  cursor: pointer;
+}
+
+table.data tbody tr.row-clickable:hover {
+  background: var(--surface-raised);
+}
+
+.align-right {
+  text-align: right;
+}
+
+.who {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.who-name {
+  font-weight: 600;
+}
+
+.who-mail {
+  color: var(--text-faint);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 26ch;
+}
+
+/* Budget meter inside a table cell. A bar plus the number, not a bar alone: the
+   bar answers "is this person close to the limit" at a glance, the number answers
+   "by how much" without a hover. */
+.meter {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-width: 150px;
+}
+
+.meter-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--border);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.meter-value {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 4.5ch;
+  text-align: right;
+}
+
+/* --- legend ---------------------------------------------------------------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 0 18px 14px;
+}
+
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.legend-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 22ch;
+}
+
+/* --- tooltip (recharts content is ours) ------------------------------------ */
+
+.tip {
+  background: rgba(9, 12, 17, 0.96);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  font-size: 12.5px;
+  box-shadow: var(--shadow);
+  min-width: 168px;
+}
+
+.tip-title {
+  font-weight: 650;
+  margin-bottom: 6px;
+}
+
+.tip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: space-between;
+}
+
+.tip-row span:last-child {
+  font-variant-numeric: tabular-nums;
+}
+
+.tip-total {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  font-weight: 650;
+}
+
+/* --- states ---------------------------------------------------------------- */
+
+.skeleton {
+  background: linear-gradient(90deg, var(--surface) 25%, var(--surface-raised) 37%, var(--surface) 63%);
+  background-size: 400% 100%;
+  animation: shimmer 1.3s ease-in-out infinite;
+  border-radius: var(--radius-sm);
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: 100% 0;
+  }
+  100% {
+    background-position: 0 0;
+  }
+}
+
+/* Respect a reduced-motion preference: the shimmer and bar transitions are
+   decorative, and for some people they are actively unpleasant. */
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+
+  .meter-fill,
+  .btn,
+  .drawer {
+    transition: none;
+  }
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  text-align: center;
+  padding: 40px 24px;
+  color: var(--text-muted);
+  min-height: 140px;
+}
+
+.empty-title {
+  color: var(--text);
+  font-weight: 650;
+}
+
+.empty p {
+  margin: 0;
+  max-width: 44ch;
+  font-size: 13px;
+}
+
+/* --- drawer (user drill-down) ---------------------------------------------- */
+
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 6, 9, 0.62);
+  z-index: 40;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: min(620px, 100vw);
+  background: var(--bg);
+  border-left: 1px solid var(--border-strong);
+  z-index: 41;
+  display: flex;
+  flex-direction: column;
+  box-shadow: -24px 0 60px rgba(0, 0, 0, 0.5);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.drawer-title {
+  margin: 0;
+  font-size: 16px;
+  letter-spacing: -0.01em;
+}
+
+.drawer-body {
+  padding: 18px 20px 36px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+}
+
+.stat-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 11px 13px;
+}
+
+.stat-label {
+  color: var(--text-muted);
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.stat-value {
+  font-size: 18px;
+  font-weight: 700;
+  margin-top: 3px;
+}
+
+/* --- footer --------------------------------------------------------------- */
+
+.foot {
+  color: var(--text-faint);
+  font-size: 12px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 18px;
+  padding-top: 4px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# CodeBuild artifact, generated at build time
+imagedefinitions.json
+
+# Local env / secrets - never commit
+.env
+*.pem
+
+# Dashboard build artefacts.
+#
+# ui/package-lock.json is deliberately NOT ignored: the image is built from it, and
+# without it in git two builds of the same commit can resolve different dependency
+# versions - which defeats the point of immutable ECR tags.
+ui/node_modules/
+ui/dist/
+
+docs/
+.DS_Store

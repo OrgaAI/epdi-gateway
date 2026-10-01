@@ -1,0 +1,27 @@
+# Keep the build context tiny and deterministic.
+.git
+.gitignore
+README.md
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+imagedefinitions.json
+
+# Dashboard build artefacts. Both MUST be excluded:
+#
+#   node_modules  a local install is large, platform-specific, and would be copied
+#                 into the Node stage only to be overwritten by `npm ci` - slowing
+#                 every build and breaking it outright when the host is macOS and the
+#                 stage is linux.
+#   dist          a stale local build would be copied in and then replaced by the
+#                 fresh one, but any file the new build does not emit would survive
+#                 and ship. That is how a deleted asset keeps being served.
+ui/node_modules/
+ui/dist/
+
+# Editor and tooling noise that has no business in a build context.
+.DS_Store
+.idea/
+.vscode/
+*.log

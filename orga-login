@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""orga-login - credential helper for the ORGA AI gateway.
+
+Turns the manual Cognito dance into two states: a browser sign-in that happens
+about once a month, and a silent token refresh that happens automatically.
+
+    orga-login setup     wire this helper into Claude Code (one-time), then login
+    orga-login login     browser sign-in, stores the refresh token
+    orga-login token     prints a valid access token (refreshes if needed)
+    orga-login status    shows what is cached and when it expires
+    orga-login logout    forgets the stored tokens
+
+The intended first run is two commands:
+
+    ./orga-login setup     # writes apiKeyHelper + ANTHROPIC_BASE_URL into ~/.claude
+    ./orga-login login     # browser sign-in through Identity Center
+
+After that Claude Code calls `token` on its own before each request, so the hourly
+access-token expiry is invisible and the browser only returns about once a month.
+
+`token` is the command Claude Code calls through its apiKeyHelper setting, which
+is why it prints the bare token to stdout and nothing else - any extra output
+would be treated as part of the credential.
+
+Why a helper exists at all: the Cognito access token lives 60 minutes, so a token
+pasted into ANTHROPIC_AUTH_TOKEN dies mid-session and Claude Code starts getting
+401s with no way to recover. The refresh token lives 30 days, so caching it turns
+an hourly interruption into a monthly one.
+
+Federated users have no other option. Their password is held by Identity Center,
+not Cognito, so the username/password flow cannot work for them - the browser
+authorization-code flow is the only route.
+
+Standard library only, so it runs on a technician's machine with no pip install.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import hashlib
+import json
+import os
+import secrets
+import shlex
+import stat
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("ORGA_CONFIG_DIR", Path.home() / ".orga-ai"))
+CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
+CONFIG_FILE = CONFIG_DIR / "config.json"
+
+# Connection settings shipped alongside the script, so a technician can just run it
+# without first creating ~/.orga-ai/config.json. Everything in it is public (issuer,
+# hosted-UI domain, a secretless app client), which is why it can live in the repo.
+# The per-user config file and environment variables still override it - this is
+# only the default used when nothing else is set.
+BUNDLED_CONFIG_FILE = Path(__file__).resolve().parent / "config.json"
+
+# Refresh this many seconds before the token actually expires, so a request that
+# starts just before the boundary does not land after it.
+EXPIRY_MARGIN_SECONDS = 300
+
+# How long to wait for the user to finish signing in before giving up.
+LOGIN_TIMEOUT_SECONDS = 300
+
+# Must match a callback URL registered on the Cognito app client, character for
+# character. Cognito rejects anything else.
+DEFAULT_REDIRECT_URI = "http://localhost:8080/callback"
+DEFAULT_IDP = "IdentityCenter"
+
+
+# --------------------------------------------------------------------------- #
+# Configuration
+# --------------------------------------------------------------------------- #
+
+def load_config() -> dict:
+    """Resolve settings from the environment, then the config file.
+
+    Environment wins so a second deployment can be pointed at without editing
+    files. Nothing is hard-coded to a specific account: the values come from the
+    Terraform `cognito` output.
+    """
+    # Three layers, lowest precedence first: the config bundled with the script, then
+    # the user's own ~/.orga-ai/config.json, then environment variables. The bundled
+    # file is what makes "just run it" work; the upper layers let a second deployment
+    # be targeted without editing anything in the repo. Comment keys (// ...) in the
+    # JSON are ignored so the shipped file can document itself.
+    file_cfg: dict = {}
+    for source in (BUNDLED_CONFIG_FILE, CONFIG_FILE):
+        if source.exists():
+            try:
+                loaded = json.loads(source.read_text())
+            except json.JSONDecodeError:
+                die(f"{source} is not valid JSON")
+            file_cfg.update({k: v for k, v in loaded.items() if not k.startswith("//")})
+
+    cfg = {
+        "client_id": os.environ.get("ORGA_CLIENT_ID", file_cfg.get("client_id", "")),
+        "cognito_domain": os.environ.get(
+            "ORGA_COGNITO_DOMAIN", file_cfg.get("cognito_domain", "")
+        ),
+        "gateway_url": os.environ.get("ORGA_GATEWAY_URL", file_cfg.get("gateway_url", "")),
+        "redirect_uri": os.environ.get(
+            "ORGA_REDIRECT_URI", file_cfg.get("redirect_uri", DEFAULT_REDIRECT_URI)
+        ),
+        "identity_provider": os.environ.get(
+            "ORGA_IDP", file_cfg.get("identity_provider", DEFAULT_IDP)
+        ),
+        # Model pins that `setup` writes into Claude Code's env. A mapping, so it has
+        # no ORGA_* equivalent: an environment variable cannot carry one. Empty is
+        # valid and means "leave Claude Code's own defaults alone".
+        "claude_models": file_cfg.get("claude_models") or {},
+    }
+
+    missing = [k for k in ("client_id", "cognito_domain") if not cfg[k]]
+    if missing:
+        # This is the first thing a new technician sees if they skip the setup step,
+        # so it has to say what to do, not just what is wrong.
+        example = BUNDLED_CONFIG_FILE.parent / "config.example.json"
+        die(
+            "missing configuration: " + ", ".join(missing) + "\n"
+            "\n"
+            "These values identify the deployment and are deliberately NOT shipped\n"
+            f"with the tool. Ask your administrator for them, then:\n"
+            "\n"
+            f"  mkdir -p {CONFIG_DIR}\n"
+            f"  cp {example} {CONFIG_FILE}\n"
+            f"  # edit {CONFIG_FILE}\n"
+            "\n"
+            "Use the file, not ORGA_* environment variables: Claude Code runs this\n"
+            "helper from a non-interactive shell that does not reliably inherit them,\n"
+            "so sign-in would work while Claude Code failed intermittently.\n"
+            "\n"
+            "Operators: the values come from the deployment's Terraform output for\n"
+            "the Cognito user pool and its CLI app client."
+        )
+
+    # Accept a bare domain or a full URL for convenience.
+    domain = cfg["cognito_domain"]
+    if not domain.startswith("http"):
+        domain = f"https://{domain}"
+    cfg["cognito_domain"] = domain.rstrip("/")
+
+    return cfg
+
+
+# --------------------------------------------------------------------------- #
+# Credential storage
+# --------------------------------------------------------------------------- #
+
+def save_credentials(data: dict) -> None:
+    """Persist tokens with owner-only permissions.
+
+    The refresh token is a 30-day bearer credential for this user's identity, so
+    the file is 0600 inside a 0700 directory. Permissions are set before the
+    write so the secret is never briefly world-readable.
+    """
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    os.chmod(CONFIG_DIR, stat.S_IRWXU)
+
+    tmp = CREDENTIALS_FILE.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        json.dump(data, handle, indent=2)
+    os.replace(tmp, CREDENTIALS_FILE)
+
+
+def load_credentials() -> dict | None:
+    if not CREDENTIALS_FILE.exists():
+        return None
+    try:
+        return json.loads(CREDENTIALS_FILE.read_text())
+    except json.JSONDecodeError:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# OAuth helpers
+# --------------------------------------------------------------------------- #
+
+def b64url(raw: bytes) -> str:
+    """base64url without padding, as the PKCE spec requires."""
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def make_pkce() -> tuple[str, str]:
+    """Generate a PKCE verifier and its S256 challenge.
+
+    PKCE matters here because this is a public client with no secret: without it,
+    anyone who intercepts the authorization code on the loopback redirect could
+    exchange it for tokens themselves.
+    """
+    verifier = b64url(secrets.token_bytes(64))
+    challenge = b64url(hashlib.sha256(verifier.encode()).digest())
+    return verifier, challenge
+
+
+def post_form(url: str, fields: dict) -> dict:
+    """POST an x-www-form-urlencoded body and parse the JSON response."""
+    body = urllib.parse.urlencode(fields).encode()
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        raise TokenError(f"{exc.code} {exc.reason}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise TokenError(f"cannot reach {url}: {exc.reason}") from exc
+
+
+class TokenError(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# login: browser authorization-code flow
+# --------------------------------------------------------------------------- #
+
+class CallbackHandler(BaseHTTPRequestHandler):
+    """Single-shot handler that captures the authorization code."""
+
+    result: dict = {}
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+
+        CallbackHandler.result = {
+            "code": (params.get("code") or [""])[0],
+            "state": (params.get("state") or [""])[0],
+            "error": (params.get("error") or [""])[0],
+            "error_description": (params.get("error_description") or [""])[0],
+        }
+
+        ok = bool(CallbackHandler.result["code"])
+        title = "Signed in" if ok else "Sign-in failed"
+        detail = (
+            "You can close this tab and return to the terminal."
+            if ok
+            else CallbackHandler.result["error_description"]
+            or CallbackHandler.result["error"]
+            or "No authorization code was returned."
+        )
+        page = f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{title}</title><style>
+body{{font-family:-apple-system,Helvetica,Arial,sans-serif;display:flex;
+height:100vh;margin:0;align-items:center;justify-content:center;background:#f7f7f5}}
+div{{text-align:center;max-width:26rem}}h1{{font-size:1.3rem;margin:0 0 .5rem;
+color:{'#1f7a3d' if ok else '#b03030'}}}p{{color:#555;line-height:1.5}}
+</style></head><body><div><h1>{title}</h1><p>{detail}</p></div></body></html>"""
+
+        encoded = page.encode()
+        self.send_response(200 if ok else 400)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, *args) -> None:  # noqa: N802
+        pass  # keep the terminal clean
+
+
+def cmd_login(cfg: dict) -> int:
+    redirect = urllib.parse.urlparse(cfg["redirect_uri"])
+    port = redirect.port or 80
+
+    verifier, challenge = make_pkce()
+    state = b64url(secrets.token_bytes(24))
+
+    query = {
+        "response_type": "code",
+        "client_id": cfg["client_id"],
+        "redirect_uri": cfg["redirect_uri"],
+        "scope": "openid email profile",
+        "state": state,
+        "code_challenge": challenge,
+        "code_challenge_method": "S256",
+    }
+    # Skips the provider chooser and goes straight to the corporate login. Drop it
+    # to reach the local-test-user form instead.
+    if cfg["identity_provider"]:
+        query["identity_provider"] = cfg["identity_provider"]
+
+    authorize_url = f"{cfg['cognito_domain']}/oauth2/authorize?" + urllib.parse.urlencode(query)
+
+    # Bound to loopback only: the redirect never leaves the machine, and nothing
+    # on the network can reach this listener.
+    try:
+        server = HTTPServer(("127.0.0.1", port), CallbackHandler)
+    except OSError as exc:
+        die(
+            f"cannot listen on 127.0.0.1:{port} ({exc}).\n"
+            f"Something else is using the port. The redirect URI is fixed at "
+            f"{cfg['redirect_uri']} because Cognito only accepts registered URLs, "
+            "so free the port and try again."
+        )
+
+    CallbackHandler.result = {}
+    thread = threading.Thread(target=server.handle_request, daemon=True)
+    thread.start()
+
+    print("Opening the browser to sign in...", file=sys.stderr)
+    print(f"If it does not open, visit:\n{authorize_url}\n", file=sys.stderr)
+    webbrowser.open(authorize_url)
+
+    thread.join(timeout=LOGIN_TIMEOUT_SECONDS)
+    server.server_close()
+
+    result = CallbackHandler.result
+    if not result:
+        die("timed out waiting for the browser sign-in")
+    if result.get("error"):
+        die(f"sign-in failed: {result['error']} {result.get('error_description', '')}")
+    if not result.get("code"):
+        die("no authorization code was returned")
+    # Rejects a code injected by a different, concurrent authorization request.
+    if result.get("state") != state:
+        die("state mismatch - discarding the response as untrusted")
+
+    try:
+        tokens = post_form(
+            f"{cfg['cognito_domain']}/oauth2/token",
+            {
+                "grant_type": "authorization_code",
+                "client_id": cfg["client_id"],
+                "code": result["code"],
+                "redirect_uri": cfg["redirect_uri"],
+                "code_verifier": verifier,
+            },
+        )
+    except TokenError as exc:
+        die(f"could not exchange the code for a token: {exc}")
+
+    store_tokens(tokens)
+    expires_in = int(tokens.get("expires_in", 3600))
+    print(
+        f"Signed in. Access token valid for {expires_in // 60} minutes; "
+        f"refresh handled automatically from now on.",
+        file=sys.stderr,
+    )
+    return 0
+
+
+def store_tokens(tokens: dict, previous: dict | None = None) -> dict:
+    """Persist the token response.
+
+    A refresh-grant response omits refresh_token, so the existing one is carried
+    forward - dropping it would silently force a browser sign-in an hour later.
+    """
+    previous = previous or load_credentials() or {}
+    data = {
+        "access_token": tokens["access_token"],
+        "refresh_token": tokens.get("refresh_token") or previous.get("refresh_token", ""),
+        "expires_at": int(time.time()) + int(tokens.get("expires_in", 3600)),
+        "token_type": tokens.get("token_type", "Bearer"),
+    }
+    save_credentials(data)
+    return data
+
+
+# --------------------------------------------------------------------------- #
+# token: what Claude Code calls
+# --------------------------------------------------------------------------- #
+
+def cmd_token(cfg: dict) -> int:
+    creds = load_credentials()
+    if not creds:
+        die("not signed in - run: orga-login login")
+
+    remaining = creds.get("expires_at", 0) - int(time.time())
+    if creds.get("access_token") and remaining > EXPIRY_MARGIN_SECONDS:
+        print(creds["access_token"])
+        return 0
+
+    refresh_token = creds.get("refresh_token")
+    if not refresh_token:
+        die("no refresh token stored - run: orga-login login")
+
+    try:
+        tokens = post_form(
+            f"{cfg['cognito_domain']}/oauth2/token",
+            {
+                "grant_type": "refresh_token",
+                "client_id": cfg["client_id"],
+                "refresh_token": refresh_token,
+            },
+        )
+    except TokenError as exc:
+        # The refresh token expired (30 days) or was revoked. Only a browser
+        # sign-in can recover, so say so plainly rather than failing obscurely.
+        die(f"refresh failed ({exc})\nRun: orga-login login")
+
+    data = store_tokens(tokens, previous=creds)
+    print(data["access_token"])
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# status / logout
+# --------------------------------------------------------------------------- #
+
+def cmd_status(cfg: dict) -> int:
+    rows = [
+        ("config file", str(CONFIG_FILE)),
+        ("credentials", str(CREDENTIALS_FILE)),
+        ("cognito domain", cfg["cognito_domain"]),
+        ("client id", cfg["client_id"]),
+        ("redirect uri", cfg["redirect_uri"]),
+        ("identity provider", cfg["identity_provider"] or "(none)"),
+    ]
+    if cfg["gateway_url"]:
+        rows.append(("gateway", cfg["gateway_url"]))
+    width = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print(f"{label:<{width}}  {value}")
+
+    creds = load_credentials()
+    if not creds:
+        print("\nnot signed in - run: orga-login login")
+        return 1
+
+    remaining = creds.get("expires_at", 0) - int(time.time())
+    if remaining > 0:
+        print(f"\naccess token     valid for {remaining // 60} min")
+    else:
+        print(f"\naccess token     expired {abs(remaining) // 60} min ago")
+    print(f"refresh token    {'stored' if creds.get('refresh_token') else 'MISSING'}")
+    return 0
+
+
+def revoke_refresh_token(cfg: dict, refresh_token: str) -> None:
+    """Revoke the refresh token at Cognito. Best effort, never fatal.
+
+    Deliberately non-fatal: logout must still clear local state when the network
+    is down or the token has already expired. A failed revoke that aborted the
+    command would leave the tokens on disk, which is the worse of the two
+    outcomes.
+
+    Not routed through post_form() because /oauth2/revoke answers 200 with an
+    EMPTY body, and post_form parses the response as JSON.
+    """
+    body = urllib.parse.urlencode(
+        {"token": refresh_token, "client_id": cfg["client_id"]}
+    ).encode()
+    request = urllib.request.Request(
+        f"{cfg['cognito_domain']}/oauth2/revoke",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15):
+            print("Refresh token revoked at Cognito.", file=sys.stderr)
+    except (urllib.error.HTTPError, urllib.error.URLError) as exc:
+        print(f"warning: could not revoke the refresh token ({exc}).", file=sys.stderr)
+
+
+def cmd_logout(cfg: dict) -> int:
+    """Three separate things have to happen, and only the second one used to.
+
+    1. Revoke the refresh token at Cognito. Without this it keeps minting new
+       access tokens for the rest of its lifetime, from any machine that has a
+       copy.
+    2. Delete the stored tokens. This is the step that ends usability here.
+    3. Clear the hosted-UI session cookie in the browser. Without it the next
+       `login` completes with NO prompt at all: Cognito still considers the
+       browser authenticated and hands back a code without asking which account
+       to use. That is why switching identity appeared to be impossible.
+
+    None of the three implies the others. And note what none of them achieve: the
+    gateway validates tokens locally, checking signature and expiry, so an access
+    token already issued stays valid until it expires no matter what is revoked.
+    Logout is a courtesy on the user's own machine, not a security boundary.
+    """
+    creds = load_credentials()
+
+    if creds and creds.get("refresh_token"):
+        revoke_refresh_token(cfg, creds["refresh_token"])
+
+    if CREDENTIALS_FILE.exists():
+        CREDENTIALS_FILE.unlink()
+        print("Stored tokens removed.", file=sys.stderr)
+    else:
+        print("Nothing stored.", file=sys.stderr)
+
+    # logout_uri MUST be one of the app client's registered sign-out URLs, or
+    # Cognito answers with an error page and the cookie survives. The registered
+    # value is "<gateway_url>/logout", which is why it is built from config rather
+    # than hardcoded.
+    gateway_url = cfg.get("gateway_url", "").rstrip("/")
+    if not gateway_url:
+        print(
+            "warning: gateway_url is not configured, so the browser session was "
+            "left alone. The next login may not prompt for an account.",
+            file=sys.stderr,
+        )
+        return 0
+
+    logout_url = f"{cfg['cognito_domain']}/logout?" + urllib.parse.urlencode(
+        {"client_id": cfg["client_id"], "logout_uri": f"{gateway_url}/logout"}
+    )
+    print("Clearing the browser session...", file=sys.stderr)
+    print(f"If it does not open, visit:\n{logout_url}\n", file=sys.stderr)
+    # The gateway does not serve /logout; it only has to be a registered URL for
+    # Cognito to accept the redirect. Say so, or the 404 reads as a failure.
+    print(
+        f"It finishes on {gateway_url}/logout, which the gateway does not serve, "
+        "so a 404 there means the sign-out worked.",
+        file=sys.stderr,
+    )
+    webbrowser.open(logout_url)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# setup: wire this helper into Claude Code
+# --------------------------------------------------------------------------- #
+
+CLAUDE_SETTINGS_FILE = Path(
+    os.environ.get("CLAUDE_CONFIG_DIR", Path.home() / ".claude")
+) / "settings.json"
+
+
+def cmd_setup(cfg: dict) -> int:
+    """Point Claude Code at the gateway, via ~/.claude/settings.json.
+
+    Sets two things: apiKeyHelper to `orga-login token`, so Claude Code fetches a
+    fresh token before each request and the 60-minute expiry stops being visible;
+    and ANTHROPIC_BASE_URL to the gateway.
+
+    MERGE, NEVER OVERWRITE. The file commonly holds unrelated settings - model
+    preferences, other env vars, permissions - and clobbering it to write two keys
+    would be a hostile thing to do to a technician's machine. So the existing JSON is
+    read, only the keys we own are changed, and everything else is preserved. A
+    timestamped backup is written first, because a corrupted settings.json breaks
+    Claude Code entirely.
+    """
+    if not cfg["gateway_url"]:
+        die("gateway_url is not set in the config, cannot configure Claude Code")
+
+    # apiKeyHelper must be an ABSOLUTE path to this script: Claude Code runs it from
+    # its own working directory, so a relative path would not resolve. resolve()
+    # also collapses any symlink the script was invoked through.
+    #
+    # QUOTED, because Claude Code runs this string through a shell. Unquoted, any
+    # space in the path - "Mis documentos", "Google Drive", a folder with the client
+    # name in it - makes the shell split it and the symptom is
+    #   apiKeyHelper failed: exited 127: /bin/sh: /path/to/first: No such file
+    # which names a path that does not exist and says nothing about quoting. Cost us
+    # an hour on a real machine before this line existed.
+    helper = f"{shlex.quote(str(Path(__file__).resolve()))} token"
+
+    settings: dict = {}
+    if CLAUDE_SETTINGS_FILE.exists():
+        try:
+            settings = json.loads(CLAUDE_SETTINGS_FILE.read_text())
+        except json.JSONDecodeError:
+            die(
+                f"{CLAUDE_SETTINGS_FILE} exists but is not valid JSON. Fix or move it "
+                "first - refusing to overwrite a file that might hold real settings."
+            )
+        if not isinstance(settings, dict):
+            die(f"{CLAUDE_SETTINGS_FILE} is not a JSON object; refusing to touch it.")
+
+    # Warn about the one setting that silently defeats the whole gateway: with
+    # CLAUDE_CODE_USE_BEDROCK set, Claude Code calls Bedrock directly and the base
+    # URL is ignored, so metering and budgets never see the traffic. Removed from the
+    # settings file if present, but it can also live in the shell environment where
+    # this script cannot reach it - hence the explicit notice.
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        env = {}
+    if env.pop("CLAUDE_CODE_USE_BEDROCK", None) is not None:
+        print(
+            "note: removed CLAUDE_CODE_USE_BEDROCK from settings - it bypasses the gateway.",
+            file=sys.stderr,
+        )
+    if os.environ.get("CLAUDE_CODE_USE_BEDROCK"):
+        print(
+            "warning: CLAUDE_CODE_USE_BEDROCK is set in your SHELL environment. "
+            "Unset it, or Claude Code will bypass the gateway and your usage will not "
+            "be metered.",
+            file=sys.stderr,
+        )
+
+    env["ANTHROPIC_BASE_URL"] = cfg["gateway_url"]
+
+    # Pin the models the gateway actually serves.
+    #
+    # Claude Code picks whatever model its own release defaults to, and it updates
+    # itself. The gateway only knows the ids in its MODEL_MAP, and when it is asked
+    # for one it does not know it SUBSTITUTES its default instead of refusing - so
+    # the request goes through with a different model than the one requested, and if
+    # the two disagree about the request format the error that surfaces talks about a
+    # `system` role rather than about the model. Unactionable for a technician.
+    #
+    # Pinning here is what makes a fresh install work on the first try, and it keeps
+    # the choice in config.json where an operator can change it without editing code.
+    for key, value in (cfg.get("claude_models") or {}).items():
+        if value:
+            env[str(key)] = str(value)
+
+    settings["env"] = env
+    settings["apiKeyHelper"] = helper
+
+    # Back up an existing file before touching it. A broken settings.json takes
+    # Claude Code down, so the escape hatch has to exist.
+    CLAUDE_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if CLAUDE_SETTINGS_FILE.exists():
+        backup = CLAUDE_SETTINGS_FILE.with_suffix(f".json.bak-{int(time.time())}")
+        backup.write_text(CLAUDE_SETTINGS_FILE.read_text())
+        print(f"Backed up existing settings to {backup}", file=sys.stderr)
+
+    tmp = CLAUDE_SETTINGS_FILE.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(settings, indent=2) + "\n")
+    os.replace(tmp, CLAUDE_SETTINGS_FILE)
+
+    print(f"Configured {CLAUDE_SETTINGS_FILE}:", file=sys.stderr)
+    print(f"  apiKeyHelper      -> {helper}", file=sys.stderr)
+    print(f"  ANTHROPIC_BASE_URL -> {cfg['gateway_url']}", file=sys.stderr)
+    for key, value in (cfg.get("claude_models") or {}).items():
+        if value:
+            print(f"  {key} -> {value}", file=sys.stderr)
+
+    if not load_credentials():
+        print("\nNext: run `orga-login login` once, then start `claude`.", file=sys.stderr)
+    else:
+        print("\nReady. Start `claude`.", file=sys.stderr)
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+
+def die(message: str) -> None:
+    print(f"orga-login: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="orga-login",
+        description="Obtain and refresh ORGA AI gateway access tokens.",
+    )
+    parser.add_argument(
+        "command",
+        choices=["login", "token", "status", "logout", "setup"],
+        help="login: browser sign-in | token: print a valid access token "
+        "| status: show cached state | logout: forget tokens "
+        "| setup: wire this helper into Claude Code (~/.claude/settings.json)",
+    )
+    args = parser.parse_args()
+
+    cfg = load_config()
+    return {
+        "login": cmd_login,
+        "token": cmd_token,
+        "status": cmd_status,
+        "logout": cmd_logout,
+        "setup": cmd_setup,
+    }[args.command](cfg)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

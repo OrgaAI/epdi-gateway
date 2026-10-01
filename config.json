@@ -1,0 +1,62 @@
+{
+  "//": [
+    "Connection settings for orga-login. This file ships WITHOUT the values that",
+    "identify a deployment, so that the tool can be distributed publicly.",
+    "",
+    "Nothing here is a credential, and nothing that was removed was one either: the",
+    "Cognito app client is PUBLIC (generate_secret = false, PKCE), and every value",
+    "removed appears in the user's own address bar on each sign-in. They were taken",
+    "out so that a public copy of this tool does not publish the account id, the",
+    "pool or the hostname to indexers and scrapers - not because knowing them",
+    "grants anything.",
+    "",
+    "The only secret in the whole flow is the user's own refresh token, which",
+    "orga-login stores under ~/.orga-ai with 0600 permissions - never here.",
+    "",
+    "THREE LAYERS, lowest precedence first:",
+    "  1. this file, shipped next to the script",
+    "  2. ~/.orga-ai/config.json          <- where the deployment values go",
+    "  3. ORGA_* environment variables",
+    "",
+    "Layer 2 is the one to use, and layer 3 is NOT a substitute for it: Claude Code",
+    "runs `orga-login token` through its apiKeyHelper from a non-interactive shell,",
+    "which does not reliably inherit variables exported in a terminal. Configure by",
+    "file and sign-in works everywhere; configure by environment and sign-in works",
+    "while Claude Code fails intermittently.",
+    "",
+    "Layer 2 lives OUTSIDE the repository, so it cannot be committed by accident.",
+    "See config.example.json for the shape, and ask your administrator for the",
+    "values for your deployment.",
+    "",
+    "Operators: refresh the values from the deployment's Terraform output after any",
+    "change to the user pool or its app clients."
+  ],
+
+  "//identity_provider": "Sends the user straight to one provider, skipping the chooser. Must match the name of a provider registered in the user pool. Kept here rather than moved to layer 2 because it names a product, not a deployment: it identifies neither the client nor the account. Override with ORGA_IDP to use a different provider, or ORGA_IDP=\"\" to reach the local sign-in form.",
+  "identity_provider": "Google",
+
+  "//redirect_uri": "Loopback address this tool listens on while the browser completes the sign-in. Must match a callback URL on the Cognito app client exactly, so the port here and there must agree. Not deployment-identifying, hence kept here.",
+  "redirect_uri": "http://localhost:8080/callback",
+
+  "//claude_models": [
+    "Written into Claude Code's env by `orga-login setup`. Model names, not secrets.",
+    "",
+    "Why this exists: Claude Code uses whatever model its own release defaults to,",
+    "and it updates itself. The gateway only serves the ids in its MODEL_MAP, and",
+    "when asked for one it does not know it SUBSTITUTES its default rather than",
+    "refusing - so the call succeeds against a different model, and if the two",
+    "disagree about the request format the error mentions a 'system' role instead of",
+    "the model. Pinning here is what makes a fresh install work first time.",
+    "",
+    "Operators: keep this in step with the model map the gateway serves, and with",
+    "which models the account can actually invoke. Set to {} to leave Claude Code",
+    "with its own defaults."
+  ],
+  "claude_models": {
+    "ANTHROPIC_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_SMALL_FAST_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "claude-sonnet-4-6",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "claude-opus-5"
+  }
+}

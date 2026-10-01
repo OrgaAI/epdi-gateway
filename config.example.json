@@ -1,0 +1,30 @@
+{
+  "//": [
+    "TEMPLATE. Copy this to ~/.orga-ai/config.json and fill in the three values,",
+    "which your administrator will send you. Do not put them back into",
+    "tools/config.json: that file is distributed publicly.",
+    "",
+    "  mkdir -p ~/.orga-ai",
+    "  cp config.example.json ~/.orga-ai/config.json",
+    "  # then edit ~/.orga-ai/config.json",
+    "",
+    "Why a file and not environment variables: Claude Code runs `orga-login token`",
+    "from a non-interactive shell, which does not reliably inherit variables you",
+    "export in a terminal. A file works regardless of who launches the process.",
+    "",
+    "Why under ~/.orga-ai and not inside the repository: it cannot be committed by",
+    "accident, so it does not depend on a .gitignore being right.",
+    "",
+    "Keys omitted here fall back to tools/config.json, so this file only needs the",
+    "three below. Check it with: ./orga-login status"
+  ],
+
+  "//client_id": "Public Cognito app client id for the CLI. No secret attached.",
+  "client_id": "<ask your administrator>",
+
+  "//cognito_domain": "Hosted-UI domain of the user pool. Bare host or full URL both accepted.",
+  "cognito_domain": "<ask your administrator>",
+
+  "//gateway_url": "Where the token is used. Lets `orga-login status` name the target; not required for sign-in itself.",
+  "gateway_url": "<ask your administrator>"
+}

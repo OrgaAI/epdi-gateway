@@ -1,0 +1,8 @@
+# JWT validation against Cognito's JWKS. [crypto] pulls in the RS256 support
+# (cryptography) that Cognito access tokens are signed with. Pinned for
+# reproducible builds.
+PyJWT[crypto]==2.9.0
+
+# AWS SDK, used to call Bedrock (InvokeModelWithResponseStream). The base image
+# does not ship boto3, so it must be installed. Pinned for reproducible builds.
+boto3==1.35.49

@@ -1,160 +1,206 @@
-# orga-login
+# epdi-ai-gateway
 
-Sign-in helper for the EPDI AI gateway. It obtains and refreshes the token that
-Claude Code needs, so you sign in with your corporate Google account and never
-handle an API key.
+Consumption gateway for the ORGA AI managed-LLM platform.
 
-One file, no dependencies beyond Python's standard library.
+It speaks the **Anthropic Messages API** on the front, so Claude Code and any
+Anthropic-compatible client can point straight at it, and calls Anthropic Claude
+models on **Amazon Bedrock** at the back, streaming answers through unbuffered.
+Technicians authenticate with a Cognito OIDC token, which the gateway validates
+itself. Runs on ECS Fargate behind an ALB.
 
----
+> **Status: inference path working, metering not built.** Auth, the
+> Anthropic-compatible surface and streaming Bedrock inference are implemented.
+> Per-user spend counters, budgets and 100% quota blocking are later roadmap
+> stages. The gateway records **spend metadata only** (token counts) - never
+> prompt or response content.
 
-## What you need
+## What is here
 
-| | How to check |
-|---|---|
-| Python 3.9 or later | `python3 --version` |
-| Claude Code | `claude --version` |
-| Three connection values | Ask your administrator (see below) |
-
----
-
-## Install
-
-### 1. Get the tool
-
-```bash
-git clone <this repository>
-cd <this repository>
-chmod +x orga-login
+```
+app/server.py     HTTP server (Python stdlib + boto3): the Messages API surface
+Dockerfile        Non-root, slim Python image; health-check baked in
+requirements.txt  PyJWT[crypto] (token validation) + boto3 (Bedrock)
+buildspec.yml     CodeBuild spec: build -> push to ECR -> imagedefinitions.json
 ```
 
-Put it somewhere permanent. Claude Code will be pointed at this exact path, so
-moving the folder later means running `./orga-login setup` again.
+Infrastructure (ECR, ECS, ALB, Cognito, CI/CD) lives in the separate
+`epdi-ai-terraform` repository. This repo owns only the application and its build.
 
-### 2. Configure it
+## Endpoints
 
-The values that identify your deployment are not shipped with the tool. Your
-administrator will give you three: a **client id**, a **Cognito domain** and a
-**gateway URL**.
+| Method | Path             | Auth | Purpose                                        |
+|--------|------------------|------|------------------------------------------------|
+| POST   | `/v1/messages`   | yes  | Inference. Anthropic Messages; SSE when `stream: true` |
+| GET    | `/v1/models`     | yes  | Model discovery for the Claude Code `/model` picker |
+| GET    | `/health`        | no   | ALB target-group health check                  |
+| GET    | `/`              | no   | JSON banner (version, default model, region)   |
+| GET    | `/whoami`        | yes  | Debug: show the validated token's claims       |
+| HEAD   | `/api/hello`     | no   | Claude Code connection-warming probe           |
 
-```bash
-mkdir -p ~/.orga-ai
-cp config.example.json ~/.orga-ai/config.json
-```
+`/health` is deliberately trivial. If it depended on Bedrock or Cognito, an
+upstream blip would make ECS cycle otherwise-healthy tasks.
 
-Then edit `~/.orga-ai/config.json` and fill them in.
+Auth is `Authorization: Bearer <cognito-access-token>` or `x-api-key` (Claude Code
+sends one or both, depending on which variable the developer set). Validation
+happens in the app, not on the ALB: ALB `authenticate-oidc` is a browser redirect
+flow and does not fit a CLI client sending a bearer token.
 
-Use the file rather than environment variables. Claude Code runs this helper from
-a non-interactive shell that does not reliably inherit variables you export in a
-terminal, so exported values make sign-in work while Claude Code fails
-intermittently.
-
-Check it:
-
-```bash
-./orga-login status
-```
-
-### 3. Connect Claude Code
+## Connect Claude Code
 
 ```bash
-./orga-login setup
+export ANTHROPIC_BASE_URL="https://gateway.example.com"   # NO trailing /v1
+export ANTHROPIC_AUTH_TOKEN="<cognito-access-token>"
+claude
 ```
 
-This edits `~/.claude/settings.json`: it points Claude Code at the gateway, sets
-the models the gateway serves, and installs this script as the credential helper.
-Your existing settings are preserved and a timestamped backup is written first.
+`ANTHROPIC_BASE_URL` must **not** end in `/v1`. Claude Code appends
+`/v1/messages` itself, so a base URL ending in `/v1` produces `/v1/v1/messages`
+and every request 404s.
 
----
+Optional: `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` makes Claude Code query
+`/v1/models` at startup and add the returned models to the `/model` picker.
 
-## Daily use
+Do **not** set `CLAUDE_CODE_USE_BEDROCK=1`. That points Claude Code straight at
+Bedrock, taking this gateway out of the request path - which would make metering
+and quota enforcement impossible.
+
+## Getting a token
+
+Two different flows, because the user pool holds two kinds of user.
+
+### Local test user (password flow, no browser)
+
+The app client has `USER_PASSWORD_AUTH` enabled for exactly this.
 
 ```bash
-./orga-login login     # once per session, opens your browser
-claude                 # work as usual
+# client_id / user_pool_id come from the Terraform `cognito` output
+terraform -chdir=../epdi-ai-terraform/environments/epdi-ai output -json cognito
+
+TOKEN=$(aws cognito-idp initiate-auth \
+  --region <AWS_REGION> \
+  --auth-flow USER_PASSWORD_AUTH \
+  --client-id <CLIENT_ID> \
+  --auth-parameters USERNAME='<email>',PASSWORD='<password>' \
+  --query 'AuthenticationResult.AccessToken' --output text)
 ```
 
-The token lasts an hour and is renewed silently in the background, so you will
-not see it expire. You only sign in again when the longer-lived session ends.
+### Federated users (Identity Center / identity store)
 
-| Command | What it does |
-|---|---|
-| `login` | Browser sign-in. Stores the session under `~/.orga-ai` |
-| `token` | Prints a valid token. This is what Claude Code calls |
-| `status` | Shows the configuration in use and whether a session is stored |
-| `logout` | Revokes the session, deletes the stored token, clears the browser session |
-| `setup` | Wires this helper into Claude Code |
+`USER_PASSWORD_AUTH` does **not** work for them: Cognito never holds their
+password, Identity Center verifies it. They must go through the Hosted UI
+authorization-code flow, which involves a browser once:
 
----
+```
+client → Hosted UI /authorize?identity_provider=IdentityCenter
+       → Identity Center login → SAML back to Cognito
+       → authorization code on the redirect URI → exchange for tokens
+```
 
-## Getting access approved
+`http://localhost:8080/callback` is already registered as a callback URL for this
+purpose. A small helper that opens the browser, catches the code on localhost and
+exchanges it for an access token is **not built yet** - it is the missing piece
+for federated technicians using Claude Code.
 
-Signing in and being authorised are two different things. Your corporate account
-lets you authenticate; using the service additionally requires that an
-administrator has approved you.
-
-The first time, expect this:
-
-1. **You sign in.** It works.
-2. **Your first request is refused**, with a message naming the group you need.
-3. **You ask your administrator** to add you. They cannot do it before your first
-   sign-in, because your profile does not exist until then.
-4. **You sign in again.** This step is required, not optional: your permissions
-   travel inside the token that was issued before you were approved, so a new one
-   has to be issued.
+## Try it with curl
 
 ```bash
-./orga-login logout
-./orga-login login
+# Non-streaming
+curl -s https://gateway.example.com/v1/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"sonnet","max_tokens":256,
+       "messages":[{"role":"user","content":"Say hi in one sentence."}]}'
+
+# Streaming (-N disables curl buffering so the SSE events show as they arrive)
+curl -N -s https://gateway.example.com/v1/messages \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -d '{"model":"sonnet","max_tokens":256,"stream":true,
+       "messages":[{"role":"user","content":"Count to five."}]}'
 ```
 
-If you skip step 4 you keep getting refused for up to an hour, until the old
-token expires on its own.
+## Run locally
 
----
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app/server.py
+```
 
-## Troubleshooting
+Unauthenticated endpoints work immediately:
 
-| What you see | What it means |
-|---|---|
-| `missing configuration: client_id, cognito_domain` | Step 2 was skipped. The message prints the exact commands |
-| `Error 403: org_internal` from Google | Your account has not been authorised on the sign-in application. Ask your administrator |
-| `not a member of ...` | You are signed in but not approved yet, or you were approved and have not signed in again. See the section above |
-| `Model access is denied ... AWS Marketplace` | The model is unavailable on the platform, not a problem with your account. Report it |
-| `apiKeyHelper failed` | Claude Code cannot run this script. Re-run `./orga-login setup`, which fixes the path |
-| `role 'system' is not supported on this model` | Claude Code is asking for a model the gateway does not serve. Re-run `./orga-login setup` and restart Claude Code |
-| `timed out waiting for the browser sign-in` | The sign-in took longer than five minutes. Run `login` again and complete it in one go |
+```bash
+curl localhost:8080/health     # {"status": "ok"}
+curl localhost:8080/           # banner
+curl -i localhost:8080/whoami  # 401 - no token
+```
 
-If `status` reports a configuration you do not recognise, remember the order of
-precedence: `ORGA_*` environment variables beat `~/.orga-ai/config.json`, which
-beats the `config.json` shipped here.
+For `/v1/messages` to reach `200`, the server needs the Cognito coordinates and
+AWS credentials with Bedrock access:
 
----
+```bash
+export COGNITO_ISSUER="https://cognito-idp.<AWS_REGION>.amazonaws.com/<USER_POOL_ID>"
+export COGNITO_JWKS_URI="$COGNITO_ISSUER/.well-known/jwks.json"
+export COGNITO_CLIENT_ID="<CLIENT_ID>"
+python app/server.py
+```
 
-## What is stored on your machine
+Without them, protected endpoints answer `401 auth not configured` by design -
+the container stays deployable and health-checkable before Cognito is wired.
 
-| Path | Contents |
-|---|---|
-| `~/.orga-ai/credentials.json` | Your session tokens, permissions `0600` |
-| `~/.orga-ai/config.json` | The three connection values |
-| `~/.claude/settings.json` | Gateway URL, model pins, credential helper |
+Or via Docker:
 
-Your tokens are the only secret in the flow, and they never leave
-`~/.orga-ai`. `logout` revokes them.
+```bash
+docker build -t epdi-ai-gateway:local .
+docker run --rm -p 8080:8080 epdi-ai-gateway:local
+```
 
----
+## Configuration
 
-## Notes for administrators
+| Env var                    | Default                                        | Meaning                                                       |
+|----------------------------|------------------------------------------------|---------------------------------------------------------------|
+| `PORT`                     | `8080`                                         | Listen port. Must match the ECS container port / ALB TG.      |
+| `APP_VERSION`              | `dev`                                          | Reported on `/`. CodeBuild sets it to the image tag.          |
+| `COGNITO_ISSUER`           | *(empty)*                                      | Cognito issuer URL; the token `iss` is checked against it.    |
+| `COGNITO_JWKS_URI`         | *(empty)*                                      | JWKS endpoint for signature verification.                     |
+| `COGNITO_CLIENT_ID`        | *(empty)*                                      | App client id; access-token `client_id` is checked against it. |
+| `BEDROCK_REGION`           | `AWS_REGION` or `eu-west-1`                    | Region of the `bedrock-runtime` endpoint.                     |
+| `BEDROCK_MODEL_ID`         | `eu.anthropic.claude-sonnet-4-5-20250929-v1:0` | Fallback model. EU inference profile keeps inference in the EU. |
+| `MODEL_MAP`                | *(empty)*                                      | JSON map of client model name → Bedrock id, e.g. `{"sonnet":"eu.anthropic.…"}`. |
+| `DEFAULT_MAX_TOKENS`       | `4096`                                         | Used only when the client omits `max_tokens`.                 |
+| `PING_INTERVAL_SECONDS`    | `15`                                           | SSE keep-alive interval during upstream silence.              |
+| `FORWARD_ANTHROPIC_BETA`   | *(off)*                                        | Translate the `anthropic-beta` header into the Bedrock `anthropic_beta` body field. |
+| `BEDROCK_ANTHROPIC_VERSION`| `bedrock-2023-05-31`                           | Bedrock dialect string in the request body.                   |
 
-Nothing in this repository is a credential. The Cognito app client is public by
-design: no secret, authorization code flow with PKCE. The three values kept out
-of `config.json` were removed so that a public copy of this tool does not publish
-an account id, a user pool or a hostname to indexers, not because knowing them
-grants anything. Every one of them appears in the user's own address bar at each
-sign-in.
+Cognito values come from the Terraform `cognito` output. The task role needs
+`bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`, plus Bedrock
+model access enabled for the Claude models.
 
-`claude_models` in `config.json` must stay in step with the model map the gateway
-serves and with the models the account can actually invoke. If they drift, the
-gateway substitutes its default model, the call succeeds against a different one
-than was requested, and the error a user eventually sees names a `system` role
-instead of the model.
+## Protocol behaviour worth knowing
+
+These are requirements of the Claude Code gateway contract, not stylistic choices:
+
+- **Never buffer.** Responses stream; a gateway that collects the full answer
+  first makes Claude Code stall.
+- **Keep-alive pings are generated here.** Claude Code aborts a stream that is
+  silent for 300s. Bedrock's event stream sends no pings of its own, so during a
+  long thinking pause the gateway emits its own `ping` events.
+- **Request body fields are forwarded as an open list.** Only fields Bedrock
+  rejects are dropped (`model`, `stream`, `context_management`, `output_config`,
+  `metadata`). Allowlisting instead would break each new Claude Code capability
+  on the release that introduces it. `cache_control` markers and block-form
+  `system` content pass through untouched, or prompt caching silently stops
+  working.
+- **Upstream errors are relayed verbatim.** Claude Code matches on the error
+  wording to decide whether to retry and disable a capability, so Bedrock's
+  message is not rewrapped. Throttling is surfaced as `429`.
+
+## Not built yet
+
+Per-user spend metering and DynamoDB counters, S3 request history, Athena/Glue
+reporting, tiered budget alerts (50/75/90%), 100% quota enforcement, the OAuth
+helper for federated logins, group-claim passthrough from federation, and the
+optional `/v1/messages/count_tokens` endpoint (without it Claude Code falls back
+to a character-based context estimate).

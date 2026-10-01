@@ -1,0 +1,76 @@
+# CodeBuild build spec for the stub gateway.
+#
+# Lives in the app repo (not the Terraform repo) on purpose: the build is owned by
+# the application side. CodeBuild reads this from the source CodePipeline hands it.
+#
+# What it does: build the image, tag it, push to ECR, and emit
+# imagedefinitions.json so the ECS deploy stage knows which image to roll out.
+#
+# ECR repositories are IMMUTABLE-tagged (see the infra repo): a tag can never be
+# overwritten. So the primary tag is the unique commit SHA. A moving branch/tag
+# alias ("main-latest" or the git tag) is ALSO pushed, but only where mutability
+# allows it - see the note in the build phase.
+#
+# Expected environment variables (set by the CodeBuild project in Terraform):
+#   ECR_REGION           - region the ECR registry lives in. NOTE this
+#                          is NOT the build's own region: the pipeline/build run in
+#                          a region with a GitHub source connection,
+#                          while ECR may be elsewhere. Using AWS_DEFAULT_REGION here
+#                          would point at the wrong, empty registry.
+#   AWS_ACCOUNT_ID       - target account, for the ECR registry host
+#   ECR_REPOSITORY       - repository name, e.g. <project>/gateway
+#   CONTAINER_NAME       - container name in the ECS task definition (for
+#                          imagedefinitions.json), e.g. gateway
+#
+# CodeBuild also injects CODEBUILD_RESOLVED_SOURCE_VERSION (full commit SHA) and,
+# for tag-based source, the webhook trigger ref.
+
+version: 0.2
+
+env:
+  variables:
+    # Overridable defaults; the CodeBuild project should set the real values.
+    CONTAINER_NAME: "gateway"
+
+phases:
+  pre_build:
+    commands:
+      - echo "Resolving image coordinates"
+      # ECR is in ECR_REGION, which may differ from the build region.
+      - REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${ECR_REGION}.amazonaws.com"
+      - REPO_URI="${REGISTRY}/${ECR_REPOSITORY}"
+      # Short SHA is the immutable, always-unique primary tag.
+      - IMAGE_TAG="${CODEBUILD_RESOLVED_SOURCE_VERSION:-manual}"
+      - SHORT_SHA="${IMAGE_TAG:0:12}"
+      - echo "Repo=${REPO_URI} tag=${SHORT_SHA}"
+      - echo "Logging in to ECR in ${ECR_REGION}"
+      - aws ecr get-login-password --region "${ECR_REGION}" | docker login --username AWS --password-stdin "${REGISTRY}"
+
+  build:
+    commands:
+      - echo "Building image"
+      # APP_VERSION bakes the tag into the running container so "/" reports it.
+      - docker build --build-arg APP_VERSION="${SHORT_SHA}" -t "${REPO_URI}:${SHORT_SHA}" .
+      - echo "Pushing ${REPO_URI}:${SHORT_SHA}"
+      - docker push "${REPO_URI}:${SHORT_SHA}"
+      # A git tag (release) is pushed as an additional, human-readable ECR tag.
+      # This only succeeds on a repository whose tags are MUTABLE, or the first
+      # time an IMMUTABLE tag is seen; a re-push of an existing immutable tag will
+      # fail by design. Releases use fresh version tags, so this is safe for them.
+      - |
+        if [ -n "${GIT_TAG}" ]; then
+          echo "Tagging release ${GIT_TAG}"
+          docker tag "${REPO_URI}:${SHORT_SHA}" "${REPO_URI}:${GIT_TAG}"
+          docker push "${REPO_URI}:${GIT_TAG}" || echo "WARN: could not push ${GIT_TAG} (already exists / immutable) - continuing"
+        fi
+
+  post_build:
+    commands:
+      - echo "Writing imagedefinitions.json for the ECS deploy stage"
+      # CodePipeline's ECS deploy action consumes this file to update the service.
+      - printf '[{"name":"%s","imageUri":"%s"}]' "${CONTAINER_NAME}" "${REPO_URI}:${SHORT_SHA}" > imagedefinitions.json
+      - cat imagedefinitions.json
+
+artifacts:
+  files:
+    - imagedefinitions.json

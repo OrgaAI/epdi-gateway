@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <!-- This page shows named individuals' spend. Keep it out of search engines
+         and out of referrer headers on any outbound link. -->
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Consumption · ORGA AI</title>
+
+    <!-- Inline so the background is correct on the very first paint: a white flash
+         before the dark theme loads looks broken on a projector. -->
+    <style>
+      html { background: #0b0e13; }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- Project-root path, NOT /admin/src/... - Vite resolves this against the
+         project root and applies `base` itself when it rewrites the tag at build
+         time. Prefixing it by hand makes the entry unresolvable and fails the
+         build. -->
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
